@@ -2,130 +2,193 @@ import fitz  # PyMuPDF
 import json
 import re
 import os
+import pandas as pd
 
 # --- Configuration ---
-PDF_FILE_PATH = 'USB_PD_R3_2 V1.1 2024-10.pdf'
+PDF_FILE_PATH = 'USB_PD_R3_2_V1.1_2024_10.pdf'
 OUTPUT_TOC_JSONL_FILE = 'usb_pd_toc.jsonl'
-DOCUMENT_TITLE = "USB Power Delivery Specification Rev 3.2 V1.1" # Extracted from the document's first page
+OUTPUT_SPEC_JSONL_FILE = 'usb_pd_spec.jsonl'
+OUTPUT_METADATA_JSONL_FILE = 'usb_pd_metadata.jsonl'
+OUTPUT_VALIDATION_REPORT_FILE = 'validation_report.xlsx'
+DOCUMENT_TITLE = "USB Power Delivery Specification Rev 3.2 V1.1"
+
+
+# --- Functions from Part 1 & 2 (with minor improvements) ---
 
 def get_toc_pages(doc):
-    """
-    Identifies the pages containing the Table of Contents.
-    This function looks for a page that starts with "Contents" and continues
-    until it finds a page that does not seem to be part of the ToC.
-    """
-    toc_pages = []
-    in_toc = False
-    for page_num, page in enumerate(doc):
-        text = page.get_text("text")
-        # A simple heuristic to find the start of the ToC
-        if "Contents" in text[:100]: # Check near the top of the page
-            in_toc = True
-        
-        if in_toc:
-            # A heuristic to detect the end of the ToC. 
-            # Often, the ToC ends before the main content (e.g., "Chapter 1") begins in earnest,
-            # or a new header like "Figures" or "Tables" appears. We'll assume for now
-            # that once we start, all pages with ToC-like lines are part of it.
-            # A more robust solution might check for a sudden change in formatting.
-            toc_pages.append(page_num)
-
-            # Heuristic to stop: If we see a page that doesn't have any ToC-like entries, we stop.
-            # This regex looks for lines starting with numbers like "1", "1.1", "1.1.1".
-            if not re.search(r"^\d+(\.\d+)*\s", text, re.MULTILINE):
-                 # Let's check a bit more robustly, sometimes the title "Contents" is on its own page
-                 if len(toc_pages) > 1: # Make sure we've actually gathered some ToC pages
-                    # This page has no ToC lines, let's remove it and stop
-                    toc_pages.pop()
-                    break
-
-    # This is a fallback in case the simple check fails. We will manually inspect the PDF.
-    # For 'USB_PD_R3_2 V1.1 2024-10.pdf', the ToC is from page 4 to 12.
-    # The page numbers in fitz are 0-indexed, so we use 3 to 11.
+    """Identifies pages for ToC, Figures, and Tables."""
+    # For 'USB_PD_R3_2 V1.1 2024-10.pdf', ToC and lists are from page 4 to 12 (0-indexed 3-11).
     return list(range(3, 12))
 
 
-def parse_toc(pdf_path):
-    """
-    Parses the Table of Contents from the given PDF file and generates a JSONL file.
-    
-    This function implements the core logic as described in the assignment:
-    - Extracts text from the identified ToC pages. [cite: 1885]
-    - Uses regex to parse section ID, title, and page number. [cite: 1923, 1924]
-    - Infers hierarchy level and parent-child relationships. [cite: 1925, 1926]
-    - Generates a JSONL output file. 
-    """
-    
-    print(f"Opening PDF: {pdf_path}")
-    if not os.path.exists(pdf_path):
-        print(f"Error: File not found at {pdf_path}")
-        return
-
-    doc = fitz.open(pdf_path)
+def parse_toc(doc, toc_pages):
+    """Parses the main Table of Contents for sections."""
+    full_toc_text = "".join([doc[page_num].get_text("text") for page_num in toc_pages])
     toc_entries = []
-    
-    # Regex to capture section_id, title, and page number.
-    # It looks for a pattern like: <section_id> <title> ........... <page_number>
-    # - ^(\d+(\.\d+)*)   -> Captures the section number at the start of a line (e.g., "2.1.2").
-    # - \s+              -> Matches the space after the section number.
-    # - ([^\n\.]+?)     -> Captures the title (non-greedily) until we see a series of dots or a newline.
-    # - \s*\.+\s* -> Matches the '....' separator, which is optional.
-    # - (\d+)$           -> Captures the page number at the end of the line.
     toc_line_regex = re.compile(r"^(\d+(?:\.\d+))\s+([^\n\.]+?)\s\.+\s*(\d+)$", re.MULTILINE)
 
-    toc_page_nums = get_toc_pages(doc)
-    print(f"Identified ToC on pages (0-indexed): {toc_page_nums}")
-
-    full_toc_text = ""
-    for page_num in toc_page_nums:
-        full_toc_text += doc[page_num].get_text("text")
-
-    # Clean up common PDF extraction artifacts, like extra spaces around newlines
-    full_toc_text = os.linesep.join([s for s in full_toc_text.splitlines() if s])
-
-    print("\n--- Parsing ToC Text ---")
-    matches = toc_line_regex.finditer(full_toc_text)
-    
-    for match in matches:
+    for match in toc_line_regex.finditer(full_toc_text):
         section_id = match.group(1).strip()
         title = match.group(2).strip()
-        page = int(match.group(3).strip())
-        
-        # Infer level from the number of dots in the section_id 
-        level = section_id.count('.') + 1
-        
-        # Determine parent_id from section_id [cite: 1926]
-        parent_id = None
-        if '.' in section_id:
-            parent_id = section_id.rsplit('.', 1)[0]
-        
-        # Construct the full_path [cite: 1896]
-        full_path = f"{section_id} {title}"
-        
-        # Create the JSON object according to the schema 
+        page = int(match.group(3).strip()) - 1  # Convert to 0-indexed
+
         entry = {
-            "doc_title": DOCUMENT_TITLE,
-            "section_id": section_id,
-            "title": title,
-            "page": page,
-            "level": level,
-            "parent_id": parent_id,
-            "full_path": full_path,
-            "tags": [] # Optional field, kept empty for now
+            "doc_title": DOCUMENT_TITLE, "section_id": section_id, "title": title, "page": page,
+            "level": section_id.count('.') + 1,
+            "parent_id": section_id.rsplit('.', 1)[0] if '.' in section_id else None,
+            "full_path": f"{section_id} {title}", "tags": []
         }
         toc_entries.append(entry)
+    return toc_entries
 
-    print(f"Successfully parsed {len(toc_entries)} ToC entries.")
-    
-    # Generate the JSONL output file 
-    print(f"Generating JSONL file: {OUTPUT_TOC_JSONL_FILE}")
+
+def extract_section_content(doc, toc_entries):
+    """Extracts the text content for each section based on the ToC entries."""
+    full_spec_entries = []
+    sorted_entries = sorted(toc_entries, key=lambda x: x['page'])
+
+    for i, current_entry in enumerate(sorted_entries):
+        start_page = current_entry['page']
+        end_page = len(doc) - 1
+        if i + 1 < len(sorted_entries):
+            end_page = sorted_entries[i + 1]['page']
+
+        content_block = "".join([doc[p].get_text("text") for p in range(start_page, end_page + 1)])
+
+        current_title_pattern = re.escape(f"{current_entry['section_id']} {current_entry['title']}")
+        start_match = re.search(current_title_pattern, content_block)
+        start_index = start_match.start() if start_match else 0
+
+        end_index = len(content_block)
+        if i + 1 < len(sorted_entries):
+            next_entry = sorted_entries[i + 1]
+            if next_entry['page'] <= end_page:
+                next_title_pattern = re.escape(f"{next_entry['section_id']} {next_entry['title']}")
+                next_match = re.search(next_title_pattern, content_block)
+                if next_match:
+                    end_index = next_match.start()
+
+        content = content_block[start_index:end_index].strip()
+
+        spec_entry = current_entry.copy()
+        spec_entry["text"] = content
+        spec_entry["page"] = current_entry['page'] + 1  # Convert back to 1-indexed for output
+        full_spec_entries.append(spec_entry)
+
+    return full_spec_entries
+
+
+# --- New Functions for Part 3 ---
+
+def parse_list_of_tables(doc, toc_pages):
+    """Parses the 'List of Tables' from the ToC pages."""
+    toc_text = "".join([doc[page_num].get_text("text") for page_num in toc_pages])
+    # Regex to find table entries like "Table 6-39. Discover Identity Command Response ......... 295"
+    table_regex = re.compile(r"^(Table\s+[\d\w-]+)\s", re.MULTILINE)
+    tables_in_toc = re.findall(table_regex, toc_text)
+    return tables_in_toc
+
+
+def count_tables_in_body(spec_entries):
+    """Counts table mentions in the parsed text content."""
+    # Regex to find "Table X-Y" in the text
+    table_regex = re.compile(r"Table\s+\d+[\w-]+\d+")
+    found_tables = []
+    for entry in spec_entries:
+        found_tables.extend(re.findall(table_regex, entry['text']))
+    return list(set(found_tables))  # Return unique table mentions
+
+
+def generate_validation_report(toc_entries, spec_entries, toc_tables, body_tables):
+    """Generates an Excel validation report."""
+    print("\n--- Generating Validation Report ---")
+
+    # 1. Section Count Comparison
+    toc_section_count = len(toc_entries)
+    parsed_section_count = len(spec_entries)
+
+    # 2. Section Mismatch/Gap Analysis
+    toc_ids = {entry['section_id'] for entry in toc_entries}
+    parsed_ids = {entry['section_id'] for entry in spec_entries}
+
+    sections_in_toc_not_parsed = list(toc_ids - parsed_ids)
+    sections_parsed_not_in_toc = list(parsed_ids - toc_ids)
+
+    # 3. Table Count Comparison
+    toc_table_count = len(toc_tables)
+    body_table_count = len(body_tables)
+
+    # 4. Create Summary DataFrame
+    summary_data = {
+        "Metric": ["Total Sections in ToC", "Total Sections Parsed", "Sections Match", "Total Tables in ToC List",
+                   "Total Tables Found in Body"],
+        "Value": [toc_section_count, parsed_section_count, "Yes" if toc_section_count == parsed_section_count else "No",
+                  toc_table_count, body_table_count]
+    }
+    summary_df = pd.DataFrame(summary_data)
+
+    # 5. Create Mismatch Details DataFrame
+    mismatch_data = {
+        "Sections in ToC but Not Parsed": pd.Series(sections_in_toc_not_parsed, dtype='str'),
+        "Sections Parsed but Not in ToC": pd.Series(sections_parsed_not_in_toc, dtype='str')
+    }
+    mismatch_df = pd.DataFrame.from_dict(mismatch_data, orient='index').transpose()
+
+    # 6. Write to Excel file
+    with pd.ExcelWriter(OUTPUT_VALIDATION_REPORT_FILE) as writer:
+        summary_df.to_excel(writer, sheet_name="Validation Summary", index=False)
+        mismatch_df.to_excel(writer, sheet_name="Mismatch Details", index=False)
+
+    print(f"Successfully created validation report: {OUTPUT_VALIDATION_REPORT_FILE}")
+
+
+# --- Main Execution Logic ---
+
+def main():
+    """Main function to run the entire parsing and validation pipeline."""
+    print(f"--- Starting Parser for {PDF_FILE_PATH} ---")
+    if not os.path.exists(PDF_FILE_PATH):
+        print(f"Error: File not found at {PDF_FILE_PATH}")
+        return
+
+    doc = fitz.open(PDF_FILE_PATH)
+
+    # Identify pages with ToC, lists of tables/figures
+    toc_pages = get_toc_pages(doc)
+
+    # Part 1: Parse ToC for sections and generate JSONL
+    toc_entries = parse_toc(doc, toc_pages)
     with open(OUTPUT_TOC_JSONL_FILE, 'w') as f:
-        for entry in toc_entries:
+        sorted_toc = sorted(toc_entries, key=lambda x: list(map(int, x['section_id'].split('.'))))
+        for entry in sorted_toc:
+            output_entry = entry.copy()
+            output_entry['page'] += 1  # 1-indexed for output
+            f.write(json.dumps(output_entry) + '\n')
+    print(f"Successfully created {OUTPUT_TOC_JSONL_FILE} with {len(toc_entries)} entries.")
+
+    # Part 2: Parse full document and generate JSONL
+    spec_entries = extract_section_content(doc, toc_entries)
+    with open(OUTPUT_SPEC_JSONL_FILE, 'w') as f:
+        sorted_spec = sorted(spec_entries, key=lambda x: list(map(int, x['section_id'].split('.'))))
+        for entry in sorted_spec:
             f.write(json.dumps(entry) + '\n')
-            
-    print("--- ToC Parsing Complete ---")
+    print(f"Successfully created {OUTPUT_SPEC_JSONL_FILE} with {len(spec_entries)} entries.")
+
+    # Generate Metadata file
+    metadata = {"doc_title": DOCUMENT_TITLE, "source_file": PDF_FILE_PATH, "total_pages": len(doc)}
+    with open(OUTPUT_METADATA_JSONL_FILE, 'w') as f:
+        f.write(json.dumps(metadata) + '\n')
+    print(f"Successfully created {OUTPUT_METADATA_JSONL_FILE}.")
+
+    # Part 3: Run Validation
+    # Get table counts for the report
+    toc_tables = parse_list_of_tables(doc, toc_pages)
+    body_tables = count_tables_in_body(spec_entries)
+    # Generate the report
+    generate_validation_report(toc_entries, spec_entries, toc_tables, body_tables)
+
+    print("\n--- Project Complete ---")
 
 
-# --- Main Execution ---
-if __name__ == "_main_":
-    parse_toc(PDF_FILE_PATH)
+if __name__ == "__main__":
+    main() 
